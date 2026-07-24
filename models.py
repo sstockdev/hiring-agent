@@ -1,3 +1,5 @@
+import json
+
 from typing import List, Optional, Dict, Tuple, Any, Protocol, runtime_checkable
 from pydantic import BaseModel, Field, field_validator
 
@@ -399,6 +401,7 @@ class ClaudeAgentProvider:
                 query,
                 ClaudeAgentOptions,
                 AssistantMessage,
+                ResultMessage,
                 TextBlock,
             )
         except ImportError as e:
@@ -425,17 +428,62 @@ class ClaudeAgentProvider:
                 "to the last message.\n\n" + "\n\n".join(transcript)
             )
 
-        agent_options = ClaudeAgentOptions(
+        # When the caller passes a JSON schema in `format`, set `output_format`
+        # so the CLI returns validated JSON in ResultMessage.structured_output
+        # instead of free-form JSON in the text, which the model sometimes
+        # gets wrong.
+        output_schema = kwargs.get("format")
+
+        option_kwargs = dict(
             model=model,
             system_prompt=system_prompt,
             tools=[],
-            max_turns=1,
+            allowed_tools=[],
+            # A no-tool query usually finishes in one turn, but structured
+            # output uses an extra internal turn, so cap at 8 rather than 1.
+            # No tools means the model cannot loop, so the higher bound is safe.
+            max_turns=8,
+            # Isolation mode. Keep the host project's CLAUDE.md, settings,
+            # skills, hooks, and MCP servers out of this subprocess. They
+            # pollute the prompt and break structured output.
+            setting_sources=[],
+            skills=[],
+            strict_mcp_config=True,
         )
+        if output_schema:
+            option_kwargs["output_format"] = {
+                "type": "json_schema",
+                "schema": output_schema,
+            }
+        agent_options = ClaudeAgentOptions(**option_kwargs)
 
-        text_parts = []
+        # The CLI may emit an in-progress assistant snapshot before the final
+        # one. Joining text across every AssistantMessage or TextBlock would
+        # glue a partial draft onto the final answer and produce two JSON
+        # objects in a row. Keep only the last assistant message, and prefer
+        # structured_output, then result.
+        text_parts: List[str] = []
+        structured_output = None
+        result_text = None
         async for msg in query(prompt=prompt, options=agent_options):
             if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, TextBlock):
-                        text_parts.append(block.text)
-        return {"message": {"role": "assistant", "content": "".join(text_parts)}}
+                text_parts = [
+                    block.text
+                    for block in msg.content
+                    if isinstance(block, TextBlock)
+                ]
+            elif isinstance(msg, ResultMessage):
+                if msg.structured_output is not None:
+                    structured_output = msg.structured_output
+                if msg.result:
+                    result_text = msg.result
+
+        if structured_output is not None:
+            # Serialize back to text so callers that json.loads() the body
+            # still work, now with valid JSON.
+            content = json.dumps(structured_output)
+        elif result_text is not None:
+            content = result_text
+        else:
+            content = "".join(text_parts)
+        return {"message": {"role": "assistant", "content": content}}
